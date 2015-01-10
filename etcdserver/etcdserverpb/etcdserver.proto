@@ -24,6 +24,7 @@ message Request {
 	required bool   Quorum     = 14 [(gogoproto.nullable) = false];
 	required int64  Time       = 15 [(gogoproto.nullable) = false];
 	required bool   Stream     = 16 [(gogoproto.nullable) = false];
+	required bool   FirstAvail = 17 [(gogoproto.nullable) = false];
 }
 
 message Metadata {

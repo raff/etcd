@@ -57,16 +57,20 @@ func (eh *EventHistory) addEvent(e *Event) *Event {
 
 // scan enumerates events from the index history and stops at the first point
 // where the key matches.
-func (eh *EventHistory) scan(key string, recursive bool, index uint64) (*Event, *etcdErr.Error) {
+func (eh *EventHistory) scan(key string, recursive bool, index uint64, firstAvail bool) (*Event, *etcdErr.Error) {
 	eh.rwl.RLock()
 	defer eh.rwl.RUnlock()
 
 	// index should be after the event history's StartIndex
 	if index < eh.StartIndex {
-		return nil,
-			etcdErr.NewError(etcdErr.EcodeEventIndexCleared,
-				fmt.Sprintf("the requested history has been cleared [%v/%v]",
-					eh.StartIndex, index), 0)
+                if firstAvail {
+                    index = eh.StartIndex
+                } else {
+                    return nil,
+                            etcdErr.NewError(etcdErr.EcodeEventIndexCleared,
+                                    fmt.Sprintf("the requested history has been cleared [%v/%v]",
+                                            eh.StartIndex, index), 0)
+                }
 	}
 
 	// the index should come before the size of the queue minus the duplicate count

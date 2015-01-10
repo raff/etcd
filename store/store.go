@@ -52,7 +52,7 @@ type Store interface {
 	Delete(nodePath string, dir, recursive bool) (*Event, error)
 	CompareAndDelete(nodePath string, prevValue string, prevIndex uint64) (*Event, error)
 
-	Watch(prefix string, recursive, stream bool, sinceIndex uint64) (Watcher, error)
+	Watch(prefix string, recursive, stream, firstAvail bool, sinceIndex uint64) (Watcher, error)
 
 	Save() ([]byte, error)
 	Recovery(state []byte) error
@@ -355,7 +355,7 @@ func (s *store) CompareAndDelete(nodePath string, prevValue string, prevIndex ui
 	return e, nil
 }
 
-func (s *store) Watch(key string, recursive, stream bool, sinceIndex uint64) (Watcher, error) {
+func (s *store) Watch(key string, recursive, stream, firstAvail bool, sinceIndex uint64) (Watcher, error) {
 	s.worldLock.RLock()
 	defer s.worldLock.RUnlock()
 
@@ -364,7 +364,7 @@ func (s *store) Watch(key string, recursive, stream bool, sinceIndex uint64) (Wa
 		sinceIndex = s.CurrentIndex + 1
 	}
 	// WatchHub does not know about the current index, so we need to pass it in
-	w, err := s.WatcherHub.watch(key, recursive, stream, sinceIndex, s.CurrentIndex)
+	w, err := s.WatcherHub.watch(key, recursive, stream, firstAvail, sinceIndex, s.CurrentIndex)
 	if err != nil {
 		return nil, err
 	}

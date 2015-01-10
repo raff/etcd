@@ -45,6 +45,7 @@ type Request struct {
 	Quorum           bool   `protobuf:"varint,14,req" json:"Quorum"`
 	Time             int64  `protobuf:"varint,15,req" json:"Time"`
 	Stream           bool   `protobuf:"varint,16,req" json:"Stream"`
+	FirstAvail       bool   `protobuf:"varint,17,req" json:"FirstAvail"`
 	XXX_unrecognized []byte `json:"-"`
 }
 
