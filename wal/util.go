@@ -20,10 +20,51 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
+
+	"github.com/coreos/etcd/pkg/fileutil"
+	"github.com/coreos/etcd/pkg/types"
 )
 
+// WalVersion is an enum for versions of etcd logs.
+type WalVersion string
+
+const (
+	WALUnknown  WalVersion = "Unknown WAL"
+	WALNotExist WalVersion = "No WAL"
+	WALv0_4     WalVersion = "0.4.x"
+	WALv0_5     WalVersion = "0.5.x"
+)
+
+func DetectVersion(dirpath string) (WalVersion, error) {
+	names, err := fileutil.ReadDir(dirpath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			err = nil
+		}
+		// Error reading the directory
+		return WALNotExist, err
+	}
+	if len(names) == 0 {
+		// Empty WAL directory
+		return WALNotExist, nil
+	}
+	nameSet := types.NewUnsafeSet(names...)
+	if nameSet.ContainsAll([]string{"snap", "wal"}) {
+		// .../wal cannot be empty to exist.
+		if Exist(path.Join(dirpath, "wal")) {
+			return WALv0_5, nil
+		}
+	}
+	if nameSet.ContainsAll([]string{"snapshot", "conf", "log"}) {
+		return WALv0_4, nil
+	}
+
+	return WALUnknown, nil
+}
+
 func Exist(dirpath string) bool {
-	names, err := readDir(dirpath)
+	names, err := fileutil.ReadDir(dirpath)
 	if err != nil {
 		return false
 	}
@@ -64,20 +105,6 @@ func isValidSeq(names []string) bool {
 	return true
 }
 
-// readDir returns the filenames in wal directory.
-func readDir(dirpath string) ([]string, error) {
-	dir, err := os.Open(dirpath)
-	if err != nil {
-		return nil, err
-	}
-	defer dir.Close()
-	names, err := dir.Readdirnames(-1)
-	if err != nil {
-		return nil, err
-	}
-	return names, nil
-}
-
 func checkWalNames(names []string) []string {
 	wnames := make([]string, 0)
 	for _, name := range names {
@@ -91,21 +118,10 @@ func checkWalNames(names []string) []string {
 }
 
 func parseWalName(str string) (seq, index uint64, err error) {
-	var num int
-	num, err = fmt.Sscanf(str, "%016x-%016x.wal", &seq, &index)
-	if num != 2 && err == nil {
-		err = fmt.Errorf("bad wal name: %s", str)
-	}
+	_, err = fmt.Sscanf(str, "%016x-%016x.wal", &seq, &index)
 	return
 }
 
 func walName(seq, index uint64) string {
 	return fmt.Sprintf("%016x-%016x.wal", seq, index)
-}
-
-func max(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }

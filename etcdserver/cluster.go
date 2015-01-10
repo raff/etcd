@@ -29,7 +29,6 @@ import (
 	"strings"
 	"sync"
 
-	etcdErr "github.com/coreos/etcd/error"
 	"github.com/coreos/etcd/pkg/flags"
 	"github.com/coreos/etcd/pkg/types"
 	"github.com/coreos/etcd/raft/raftpb"
@@ -42,11 +41,18 @@ const (
 )
 
 type ClusterInfo interface {
+	// ID returns the cluster ID
 	ID() types.ID
+	// ClientURLs returns an aggregate set of all URLs on which this
+	// cluster is listening for client requests
 	ClientURLs() []string
 	// Members returns a slice of members sorted by their ID
 	Members() []*Member
+	// Member retrieves a particular member based on ID, or nil if the
+	// member does not exist in the cluster
 	Member(id types.ID) *Member
+	// IsIDRemoved checks whether the given ID has been removed from this
+	// cluster at some point in the past
 	IsIDRemoved(id types.ID) bool
 }
 
@@ -62,8 +68,9 @@ type Cluster struct {
 	sync.Mutex
 }
 
-// NewClusterFromString returns Cluster through given cluster token and parsing
-// members from a sets of names to IPs discovery formatted like:
+// NewClusterFromString returns a Cluster instantiated from the given cluster token
+// and cluster string, by parsing members from a set of discovery-formatted
+// names-to-IPs, like:
 // mach0=http://1.1.1.1,mach0=http://2.2.2.2,mach1=http://3.3.3.3,mach2=http://4.4.4.4
 func NewClusterFromString(token string, cluster string) (*Cluster, error) {
 	c := newCluster(token)
@@ -127,12 +134,6 @@ func (c *Cluster) Members() []*Member {
 	return []*Member(sms)
 }
 
-type SortableMemberSlice []*Member
-
-func (s SortableMemberSlice) Len() int           { return len(s) }
-func (s SortableMemberSlice) Less(i, j int) bool { return s[i].ID < s[j].ID }
-func (s SortableMemberSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
-
 func (c *Cluster) Member(id types.ID) *Member {
 	c.Lock()
 	defer c.Unlock()
@@ -173,25 +174,23 @@ func (c *Cluster) IsIDRemoved(id types.ID) bool {
 	return c.removed[id]
 }
 
-// PeerURLs returns a list of all peer addresses. Each address is prefixed
-// with the scheme (currently "http://"). The returned list is sorted in
-// ascending lexicographical order.
+// PeerURLs returns a list of all peer addresses.
+// The returned list is sorted in ascending lexicographical order.
 func (c *Cluster) PeerURLs() []string {
 	c.Lock()
 	defer c.Unlock()
-	endpoints := make([]string, 0)
+	urls := make([]string, 0)
 	for _, p := range c.members {
 		for _, addr := range p.PeerURLs {
-			endpoints = append(endpoints, addr)
+			urls = append(urls, addr)
 		}
 	}
-	sort.Strings(endpoints)
-	return endpoints
+	sort.Strings(urls)
+	return urls
 }
 
-// ClientURLs returns a list of all client addresses. Each address is prefixed
-// with the scheme (currently "http://"). The returned list is sorted in
-// ascending lexicographical order.
+// ClientURLs returns a list of all client addresses.
+// The returned list is sorted in ascending lexicographical order.
 func (c *Cluster) ClientURLs() []string {
 	c.Lock()
 	defer c.Unlock()
@@ -218,33 +217,6 @@ func (c *Cluster) String() string {
 	return strings.Join(sl, ",")
 }
 
-// ValidateAndAssignIDs validates the given members by matching their PeerURLs
-// with the existing members in the cluster. If the validation succeeds, it
-// assigns the IDs from the given members to the existing members in the
-// cluster. If the validation fails, an error will be returned.
-func (c *Cluster) ValidateAndAssignIDs(membs []*Member) error {
-	if len(c.members) != len(membs) {
-		return fmt.Errorf("member count is unequal")
-	}
-	omembs := make([]*Member, 0)
-	for _, m := range c.members {
-		omembs = append(omembs, m)
-	}
-	sort.Sort(SortableMemberSliceByPeerURLs(omembs))
-	sort.Sort(SortableMemberSliceByPeerURLs(membs))
-	for i := range omembs {
-		if !reflect.DeepEqual(omembs[i].PeerURLs, membs[i].PeerURLs) {
-			return fmt.Errorf("unmatched member while checking PeerURLs")
-		}
-		omembs[i].ID = membs[i].ID
-	}
-	c.members = make(map[types.ID]*Member)
-	for _, m := range omembs {
-		c.members[m.ID] = m
-	}
-	return nil
-}
-
 func (c *Cluster) genID() {
 	mIDs := c.MemberIDs()
 	b := make([]byte, 8*len(mIDs))
@@ -259,16 +231,21 @@ func (c *Cluster) SetID(id types.ID) { c.id = id }
 
 func (c *Cluster) SetStore(st store.Store) { c.store = st }
 
+func (c *Cluster) Recover() {
+	c.members, c.removed = membersFromStore(c.store)
+}
+
 // ValidateConfigurationChange takes a proposed ConfChange and
 // ensures that it is still valid.
 func (c *Cluster) ValidateConfigurationChange(cc raftpb.ConfChange) error {
 	members, removed := membersFromStore(c.store)
-	if removed[types.ID(cc.NodeID)] {
+	id := types.ID(cc.NodeID)
+	if removed[id] {
 		return ErrIDRemoved
 	}
 	switch cc.Type {
 	case raftpb.ConfChangeAddNode:
-		if members[types.ID(cc.NodeID)] != nil {
+		if members[id] != nil {
 			return ErrIDExists
 		}
 		urls := make(map[string]bool)
@@ -287,16 +264,39 @@ func (c *Cluster) ValidateConfigurationChange(cc raftpb.ConfChange) error {
 			}
 		}
 	case raftpb.ConfChangeRemoveNode:
-		if members[types.ID(cc.NodeID)] == nil {
+		if members[id] == nil {
 			return ErrIDNotFound
 		}
+	case raftpb.ConfChangeUpdateNode:
+		if members[id] == nil {
+			return ErrIDNotFound
+		}
+		urls := make(map[string]bool)
+		for _, m := range members {
+			if m.ID == id {
+				continue
+			}
+			for _, u := range m.PeerURLs {
+				urls[u] = true
+			}
+		}
+		m := new(Member)
+		if err := json.Unmarshal(cc.Context, m); err != nil {
+			log.Panicf("unmarshal member should never fail: %v", err)
+		}
+		for _, u := range m.PeerURLs {
+			if urls[u] {
+				return ErrPeerURLexists
+			}
+		}
 	default:
-		log.Panicf("ConfChange type should be either AddNode or RemoveNode")
+		log.Panicf("ConfChange type should be either AddNode, RemoveNode or UpdateNode")
 	}
 	return nil
 }
 
-// AddMember puts a new Member into the store.
+// AddMember adds a new Member into the cluster, and saves the given member's
+// raftAttributes into the store. The given member should have empty attributes.
 // A Member with a matching id must not exist.
 func (c *Cluster) AddMember(m *Member) {
 	c.Lock()
@@ -308,14 +308,6 @@ func (c *Cluster) AddMember(m *Member) {
 	p := path.Join(memberStoreKey(m.ID), raftAttributesSuffix)
 	if _, err := c.store.Create(p, false, string(b), false, store.Permanent); err != nil {
 		log.Panicf("create raftAttributes should never fail: %v", err)
-	}
-	b, err = json.Marshal(m.Attributes)
-	if err != nil {
-		log.Panicf("marshal attributes should never fail: %v", err)
-	}
-	p = path.Join(memberStoreKey(m.ID), attributesSuffix)
-	if _, err := c.store.Create(p, false, string(b), false, store.Permanent); err != nil {
-		log.Panicf("create attributes should never fail: %v", err)
 	}
 	c.members[m.ID] = m
 }
@@ -335,32 +327,25 @@ func (c *Cluster) RemoveMember(id types.ID) {
 	c.removed[id] = true
 }
 
-func (c *Cluster) UpdateMemberAttributes(id types.ID, attr Attributes) {
+func (c *Cluster) UpdateAttributes(id types.ID, attr Attributes) {
 	c.Lock()
 	defer c.Unlock()
 	c.members[id].Attributes = attr
+	// TODO: update store in this function
 }
 
-// nodeToMember builds member through a store node.
-// the child nodes of the given node should be sorted by key.
-func nodeToMember(n *store.NodeExtern) (*Member, error) {
-	m := &Member{ID: mustParseMemberIDFromKey(n.Key)}
-	if len(n.Nodes) != 2 {
-		return m, fmt.Errorf("len(nodes) = %d, want 2", len(n.Nodes))
+func (c *Cluster) UpdateRaftAttributes(id types.ID, raftAttr RaftAttributes) {
+	c.Lock()
+	defer c.Unlock()
+	b, err := json.Marshal(raftAttr)
+	if err != nil {
+		log.Panicf("marshal raftAttributes should never fail: %v", err)
 	}
-	if w := path.Join(n.Key, attributesSuffix); n.Nodes[0].Key != w {
-		return m, fmt.Errorf("key = %v, want %v", n.Nodes[0].Key, w)
+	p := path.Join(memberStoreKey(id), raftAttributesSuffix)
+	if _, err := c.store.Update(p, string(b), store.Permanent); err != nil {
+		log.Panicf("update raftAttributes should never fail: %v", err)
 	}
-	if err := json.Unmarshal([]byte(*n.Nodes[0].Value), &m.Attributes); err != nil {
-		return m, fmt.Errorf("unmarshal attributes error: %v", err)
-	}
-	if w := path.Join(n.Key, raftAttributesSuffix); n.Nodes[1].Key != w {
-		return m, fmt.Errorf("key = %v, want %v", n.Nodes[1].Key, w)
-	}
-	if err := json.Unmarshal([]byte(*n.Nodes[1].Value), &m.RaftAttributes); err != nil {
-		return m, fmt.Errorf("unmarshal raftAttributes error: %v", err)
-	}
-	return m, nil
+	c.members[id].RaftAttributes = raftAttr
 }
 
 func membersFromStore(st store.Store) (map[types.ID]*Member, map[types.ID]bool) {
@@ -394,7 +379,28 @@ func membersFromStore(st store.Store) (map[types.ID]*Member, map[types.ID]bool) 
 	return members, removed
 }
 
-func isKeyNotFound(err error) bool {
-	e, ok := err.(*etcdErr.Error)
-	return ok && e.ErrorCode == etcdErr.EcodeKeyNotFound
+// ValidateClusterAndAssignIDs validates the local cluster by matching the PeerURLs
+// with the existing cluster. If the validation succeeds, it assigns the IDs
+// from the existing cluster to the local cluster.
+// If the validation fails, an error will be returned.
+func ValidateClusterAndAssignIDs(local *Cluster, existing *Cluster) error {
+	ems := existing.Members()
+	lms := local.Members()
+	if len(ems) != len(lms) {
+		return fmt.Errorf("member count is unequal")
+	}
+	sort.Sort(SortableMemberSliceByPeerURLs(ems))
+	sort.Sort(SortableMemberSliceByPeerURLs(lms))
+
+	for i := range ems {
+		if !reflect.DeepEqual(ems[i].PeerURLs, lms[i].PeerURLs) {
+			return fmt.Errorf("unmatched member while checking PeerURLs")
+		}
+		lms[i].ID = ems[i].ID
+	}
+	local.members = make(map[types.ID]*Member)
+	for _, m := range lms {
+		local.members[m.ID] = m
+	}
+	return nil
 }

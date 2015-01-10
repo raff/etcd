@@ -26,22 +26,24 @@ import (
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/coreos/etcd/wal"
+	"github.com/coreos/etcd/wal/walpb"
 )
 
-func restartAsStandaloneNode(cfg *ServerConfig, index uint64, snapshot *raftpb.Snapshot) (id types.ID, n raft.Node, w *wal.WAL) {
-	var err error
-	if w, err = wal.OpenAtIndex(cfg.WALDir(), index); err != nil {
-		log.Fatalf("etcdserver: open wal error: %v", err)
+func restartAsStandaloneNode(cfg *ServerConfig, snapshot *raftpb.Snapshot) (types.ID, raft.Node, *raft.MemoryStorage, *wal.WAL) {
+	var walsnap walpb.Snapshot
+	if snapshot != nil {
+		walsnap.Index, walsnap.Term = snapshot.Metadata.Index, snapshot.Metadata.Term
 	}
-	id, cid, st, ents, err := readWAL(w, index)
-	if err != nil {
-		log.Fatalf("etcdserver: read wal error: %v", err)
-	}
+	w, id, cid, st, ents := readWAL(cfg.WALDir(), walsnap)
 	cfg.Cluster.SetID(cid)
 
 	// discard the previously uncommitted entries
-	if len(ents) != 0 {
-		ents = ents[:st.Commit+1]
+	for i, ent := range ents {
+		if ent.Index > st.Commit {
+			log.Printf("etcdserver: discarding %d uncommitted WAL entries ", len(ents)-i)
+			ents = ents[:i]
+			break
+		}
 	}
 
 	// force append the configuration change entries
@@ -49,19 +51,23 @@ func restartAsStandaloneNode(cfg *ServerConfig, index uint64, snapshot *raftpb.S
 	ents = append(ents, toAppEnts...)
 
 	// force commit newly appended entries
-	for _, e := range toAppEnts {
-		err := w.SaveEntry(&e)
-		if err != nil {
-			log.Fatalf("etcdserver: %v", err)
-		}
+	err := w.Save(raftpb.HardState{}, toAppEnts)
+	if err != nil {
+		log.Fatalf("etcdserver: %v", err)
 	}
 	if len(ents) != 0 {
 		st.Commit = ents[len(ents)-1].Index
 	}
 
 	log.Printf("etcdserver: forcing restart of member %s in cluster %s at commit index %d", id, cfg.Cluster.ID(), st.Commit)
-	n = raft.RestartNode(uint64(id), 10, 1, snapshot, st, ents)
-	return
+	s := raft.NewMemoryStorage()
+	if snapshot != nil {
+		s.ApplySnapshot(*snapshot)
+	}
+	s.SetHardState(st)
+	s.Append(ents)
+	n := raft.RestartNode(uint64(id), 10, 1, s)
+	return id, n, s, w
 }
 
 // getIDs returns an ordered set of IDs included in the given snapshot and
@@ -72,7 +78,7 @@ func restartAsStandaloneNode(cfg *ServerConfig, index uint64, snapshot *raftpb.S
 func getIDs(snap *raftpb.Snapshot, ents []raftpb.Entry) []uint64 {
 	ids := make(map[uint64]bool)
 	if snap != nil {
-		for _, id := range snap.Nodes {
+		for _, id := range snap.Metadata.ConfState.Nodes {
 			ids[id] = true
 		}
 	}
